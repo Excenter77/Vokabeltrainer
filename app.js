@@ -25,6 +25,8 @@ const saveLists = () => save(STORE_LISTS, customLists);
 let profile = null;      // aktives Kind
 let currentList = null;  // ausgewaehlte Liste
 let session = null;      // laufende Abfrage
+let ocrLoadPromise = null;
+let ocrWorker = null;
 
 const esc = s => String(s).replace(/[&<>"']/g, c =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
@@ -194,10 +196,15 @@ function showListForm() {
     <h1>Eigene Liste</h1>
     <form class="card" data-submit="saveList">
       <label>Titel <input name="titel" maxlength="40" placeholder="z. B. Unit 3" autofocus></label>
+      <label>Foto vom Schulbuch
+        <input id="list-photo" type="file" accept="image/*" capture="environment">
+      </label>
+      <button type="button" class="wide" data-action="scanPhoto" disabled>Foto auswerten</button>
+      <p id="photo-status" class="hint" aria-live="polite"></p>
       <label>Wörter – eine Zeile pro Wort: <i>englisch ; deutsch</i>
         <textarea name="woerter" rows="12" placeholder="dog ; der Hund&#10;to run ; rennen / laufen"></textarea>
       </label>
-      <p class="hint">Aus Excel kopierte Spalten gehen auch. Eine geteilte Liste hier einfach komplett einfügen.</p>
+      <p class="hint">Erkannte Wörter bitte prüfen und korrigieren. Aus Excel kopierte Spalten gehen auch; eine geteilte Liste hier einfach komplett einfügen.</p>
       <button type="submit" class="primary wide">Speichern</button>
     </form>`);
 }
@@ -260,8 +267,9 @@ function showQuestion() {
     </header>
     <span class="bar"><span style="width:${Math.round(s.idx / s.queue.length * 100)}%"></span></span>
     <div class="card prompt"><span class="word">${esc(prompt)}</span>${speakBtn(prompt, promptLang)}</div>
-    <div id="feedback"></div>
-    <div id="body">${body}</div>`);
+    <div id="next-slot"></div>
+    <div id="body">${body}</div>
+    <div id="feedback"></div>`);
 }
 
 function record(it, ok) {
@@ -284,10 +292,12 @@ function answerResult(ok) {
   s.answered = true;
   if (s.mode === "type") {
     app.querySelector(".answer input").readOnly = true;
-    app.querySelector(".answer button").textContent = "Weiter";
+    app.querySelector(".answer button").remove();
   } else {
     app.querySelectorAll("#body button").forEach(b => { b.disabled = true; });
   }
+  document.getElementById("next-slot").innerHTML =
+    '<button class="primary wide" data-action="next" id="next">Weiter</button>';
   document.getElementById("feedback").innerHTML = `
     <div class="card result ${ok ? "ok" : "bad"}">
       <div>
@@ -295,9 +305,8 @@ function answerResult(ok) {
         ${ok ? "" : `<span>Richtig ist: <b>${esc(answer)}</b></span>`}
       </div>
       ${speakBtn(answer, answerLang)}
-    </div>
-    ${s.mode === "type" ? "" : `<button class="primary wide" data-action="next" id="next">Weiter</button>`}`;
-  document.getElementById("next")?.focus();
+    </div>`;
+  document.getElementById("next").focus();
 }
 
 function next() {
@@ -338,6 +347,101 @@ function parseList(text) {
     if (m) woerter.push([m[1].trim(), m[2].trim()]);
   }
   return { titel, woerter };
+}
+
+function loadOcrEngine() {
+  if (window.Tesseract) return Promise.resolve(window.Tesseract);
+  if (!ocrLoadPromise) {
+    ocrLoadPromise = new Promise((resolve, reject) => {
+      const script = document.createElement("script");
+      script.src = "https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js";
+      script.onload = () => {
+        if (window.Tesseract) resolve(window.Tesseract);
+        else {
+          ocrLoadPromise = null;
+          reject(new Error("Die OCR-Engine konnte nicht gestartet werden."));
+        }
+      };
+      script.onerror = () => {
+        ocrLoadPromise = null;
+        reject(new Error("OCR-Engine konnte nicht geladen werden. Bitte Internetverbindung prüfen."));
+      };
+      document.head.append(script);
+    });
+  }
+  return ocrLoadPromise;
+}
+
+function extractVocabularyPairs(data, imageWidth) {
+  const explicitPairs = parseList(data.text).woerter;
+  if (explicitPairs.length) return explicitPairs;
+
+  const words = (data.words ?? [])
+    .filter(w => w.text?.trim() && w.confidence >= 20 && w.bbox)
+    .map(w => ({ text: w.text.trim(), x: (w.bbox.x0 + w.bbox.x1) / 2, y: (w.bbox.y0 + w.bbox.y1) / 2,
+      height: w.bbox.y1 - w.bbox.y0 }));
+  if (!words.length) return [];
+
+  imageWidth ??= data.imageSize?.width ?? Math.max(...words.map(w => w.x * 2));
+  const heights = words.map(w => w.height).sort((a, b) => a - b);
+  const rowTolerance = Math.max(8, heights[Math.floor(heights.length / 2)] * 0.65);
+  const rows = [];
+  for (const word of words.sort((a, b) => a.y - b.y || a.x - b.x)) {
+    let row = rows[rows.length - 1];
+    if (!row || Math.abs(row.y - word.y) > rowTolerance) {
+      row = { y: word.y, words: [] };
+      rows.push(row);
+    }
+    row.words.push(word);
+  }
+
+  return rows.map(row => {
+    const left = row.words.filter(w => w.x < imageWidth / 2).sort((a, b) => a.x - b.x);
+    const right = row.words.filter(w => w.x >= imageWidth / 2).sort((a, b) => a.x - b.x);
+    return [left.map(w => w.text).join(" "), right.map(w => w.text).join(" ")];
+  }).filter(([left, right]) => left && right);
+}
+
+async function scanPhoto() {
+  const file = document.getElementById("list-photo").files[0];
+  const status = document.getElementById("photo-status");
+  const button = app.querySelector('[data-action="scanPhoto"]');
+  if (!file) return;
+
+  button.disabled = true;
+  status.textContent = "OCR-Engine wird geladen …";
+  try {
+    const Tesseract = await loadOcrEngine();
+    if (!ocrWorker) {
+      ocrWorker = await Tesseract.createWorker(["eng", "deu"], 1, {
+        logger: message => {
+          if (status.isConnected && message.status === "recognizing text") {
+            status.textContent = `Foto wird ausgewertet … ${Math.round(message.progress * 100)} %`;
+          }
+        },
+      });
+    }
+    const { data } = await ocrWorker.recognize(file);
+    const image = await createImageBitmap(file);
+    const pairs = extractVocabularyPairs(data, image.width);
+    image.close();
+    const extracted = pairs.length
+      ? pairs.map(([english, german]) => `${english} ; ${german}`).join("\n")
+      : data.text.trim();
+    if (!extracted) throw new Error("Auf dem Foto wurde kein Text erkannt.");
+
+    const textarea = app.querySelector('textarea[name="woerter"]');
+    textarea.value = [textarea.value.trim(), extracted].filter(Boolean).join("\n");
+    status.textContent = pairs.length
+      ? `${pairs.length} Vokabelpaare erkannt (linke Spalte Englisch, rechte Deutsch). Bitte prüfen.`
+      : "Text erkannt, aber keine sicheren Wortpaare gefunden. Bitte pro Zeile mit ; trennen.";
+    textarea.focus();
+  } catch (error) {
+    console.error("Fotoauswertung fehlgeschlagen:", error);
+    status.textContent = `Foto konnte nicht ausgewertet werden: ${error.message}`;
+  } finally {
+    if (button.isConnected) button.disabled = false;
+  }
 }
 
 async function shareList(list) {
@@ -397,6 +501,7 @@ const actions = {
   unknown: () => { record(current().it, false); next(); },
   next,
   editList: showListForm,
+  scanPhoto,
   shareList: () => shareList(currentList),
   deleteList: () => {
     if (!confirm(`Liste „${currentList.titel}“ auf diesem Gerät löschen?`)) return;
@@ -454,6 +559,14 @@ app.addEventListener("submit", e => {
   e.preventDefault();
   const f = e.target;
   forms[f.dataset.submit](f, Object.fromEntries(new FormData(f)));
+});
+
+app.addEventListener("change", e => {
+  if (e.target.id !== "list-photo") return;
+  const button = app.querySelector('[data-action="scanPhoto"]');
+  const status = document.getElementById("photo-status");
+  button.disabled = !e.target.files.length;
+  status.textContent = e.target.files.length ? "Foto bereit zur Auswertung." : "";
 });
 
 // ---------- Start ----------
